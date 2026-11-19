@@ -6,6 +6,7 @@ import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.ActivityOptions
 import android.app.AlertDialog
 import android.app.Notification
 import android.app.NotificationChannel
@@ -13,6 +14,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -26,6 +28,7 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.SweepGradient
@@ -36,6 +39,10 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.MediaMetadata
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -46,7 +53,11 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import android.text.InputFilter
+import android.text.TextPaint
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -60,13 +71,16 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.tanh
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -258,24 +272,30 @@ object Store {
 }
 
 // ===== SoundFx =====
-/** Small synthesized UI sounds (no audio files needed). Silent when the phone is on silent/vibrate. */
+/** Short, crisp synthesized UI sounds (no audio files). Silent when the phone is on silent/vibrate. */
 class SoundFx(ctx: Context) {
     private val rate = 44100
     private val tracks = HashMap<String, AudioTrack>()
     private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     var enabled = true
 
-    private class Comp(val noise: Boolean, val f1: Double, val f2: Double, val dur: Double, val gain: Double, val delay: Double = 0.0)
+    /** type 0 = sine sweep, 1 = high-passed noise click. tau = decay time constant in seconds. */
+    private class Comp(val type: Int, val f1: Double, val f2: Double, val dur: Double, val gain: Double, val tau: Double, val delay: Double = 0.0)
 
     init {
         try {
-            put("open", render(Comp(true, 500.0, 2600.0, 0.30, 0.30), Comp(false, 440.0, 880.0, 0.24, 0.16)))
-            put("sub", render(Comp(true, 900.0, 2800.0, 0.20, 0.22), Comp(false, 620.0, 990.0, 0.16, 0.12)))
-            put("close", render(Comp(true, 2400.0, 450.0, 0.24, 0.24), Comp(false, 720.0, 330.0, 0.20, 0.12)))
-            put("tick", render(Comp(false, 2500.0, 2100.0, 0.03, 0.14)))
-            put("page", render(Comp(false, 1200.0, 1600.0, 0.06, 0.16), Comp(false, 1600.0, 2200.0, 0.06, 0.14, 0.07)))
-            put("launch", render(Comp(false, 660.0, 660.0, 0.16, 0.18), Comp(false, 990.0, 990.0, 0.30, 0.16, 0.09), Comp(true, 800.0, 3000.0, 0.25, 0.14)))
-            put("drop", render(Comp(false, 320.0, 190.0, 0.09, 0.22)))
+            val tick = arrayOf(
+                Comp(0, 4200.0, 3900.0, 0.030, 0.22, 0.004),
+                Comp(0, 1900.0, 1850.0, 0.020, 0.10, 0.003),
+                Comp(1, 0.0, 0.0, 0.008, 0.14, 0.0015)
+            )
+            put("tick", render(*tick))
+            put("open", render(Comp(0, 520.0, 780.0, 0.10, 0.17, 0.03), Comp(0, 1560.0, 1700.0, 0.07, 0.05, 0.015), *tick))
+            put("sub", render(Comp(0, 660.0, 880.0, 0.08, 0.13, 0.022), *tick))
+            put("close", render(Comp(0, 700.0, 420.0, 0.10, 0.14, 0.03), Comp(1, 0.0, 0.0, 0.006, 0.08, 0.0015)))
+            put("page", render(*tick, Comp(0, 4600.0, 4300.0, 0.03, 0.18, 0.004, 0.07), Comp(1, 0.0, 0.0, 0.008, 0.10, 0.0015, 0.07)))
+            put("launch", render(Comp(0, 880.0, 880.0, 0.30, 0.12, 0.07), Comp(0, 1320.0, 1320.0, 0.35, 0.09, 0.08, 0.05), Comp(0, 1760.0, 1760.0, 0.30, 0.04, 0.06, 0.05)))
+            put("drop", render(Comp(0, 240.0, 160.0, 0.09, 0.20, 0.025), Comp(1, 0.0, 0.0, 0.006, 0.08, 0.0015)))
         } catch (e: Exception) {
             // Sound is optional; ignore failures.
         }
@@ -284,37 +304,31 @@ class SoundFx(ctx: Context) {
     private fun render(vararg cs: Comp): ShortArray {
         var total = 0.0
         for (c in cs) total = maxOf(total, c.delay + c.dur)
-        val n = ((total + 0.02) * rate).toInt()
+        val n = ((total + 0.01) * rate).toInt()
         val out = DoubleArray(n)
-        val rnd = java.util.Random(7)
+        val rnd = java.util.Random(11)
         for (c in cs) {
             val start = (c.delay * rate).toInt()
             val len = (c.dur * rate).toInt()
             var phase = 0.0
             var lp = 0.0
-            var lp2 = 0.0
             for (i in 0 until len) {
                 val t = i.toDouble() / rate
-                val f = c.f1 * (c.f2 / c.f1).pow(t / c.dur)
-                val v: Double
-                val env: Double
-                if (c.noise) {
-                    val a = min(1.0, 2 * PI * f / rate)
+                val env = min(1.0, t / 0.0015) * exp(-t / c.tau)
+                val v = if (c.type == 1) {
                     val x = rnd.nextDouble() * 2 - 1
-                    lp += a * (x - lp)
-                    lp2 += a * 0.5 * (lp - lp2)
-                    v = (lp - lp2) * 3.0
-                    env = sin(PI * t / c.dur).pow(1.5)
+                    lp += 0.35 * (x - lp)
+                    x - lp
                 } else {
+                    val f = c.f1 * (c.f2 / c.f1).pow(t / c.dur)
                     phase += 2 * PI * f / rate
-                    v = sin(phase)
-                    env = min(1.0, t / 0.008) * exp(-4.0 * t / c.dur)
+                    sin(phase)
                 }
                 val idx = start + i
                 if (idx < n) out[idx] += v * env * c.gain
             }
         }
-        return ShortArray(n) { (out[it].coerceIn(-1.0, 1.0) * 32767).toInt().toShort() }
+        return ShortArray(n) { (tanh(out[it] * 1.2) * 32767 * 0.9).toInt().toShort() }
     }
 
     private fun put(name: String, data: ShortArray) {
@@ -379,50 +393,488 @@ class Haptics(ctx: Context) {
     fun heavy() = fire(VibrationEffect.EFFECT_HEAVY_CLICK, 22, 200)
 }
 
-// ===== BubbleView =====
-/** The floating glass ball, like AssistiveTouch. */
+// ===== Notifications and music =====
+class NotifChat(val title: String, val lines: List<String>)
+
+class AppNotifs(val pkg: String, val label: String) {
+    val keys = ArrayList<String>()
+    val chats = ArrayList<NotifChat>()
+    var intent: PendingIntent? = null
+    var messaging = false
+    val count: Int get() = chats.size
+}
+
+/** Reads notifications (for the red dot and message previews) and gives access to music sessions. */
+class BubbleNotifListener : NotificationListenerService() {
+    companion object {
+        @Volatile
+        var instance: BubbleNotifListener? = null
+
+        @Volatile
+        var groups: List<AppNotifs> = emptyList()
+
+        var onChange: (() -> Unit)? = null
+
+        val MESSAGING = setOf(
+            "com.whatsapp", "com.whatsapp.w4b", "org.telegram.messenger", "org.thoughtcrime.securesms",
+            "com.google.android.apps.messaging", "com.samsung.android.messaging", "com.android.mms",
+            "com.facebook.orca", "com.instagram.android", "com.snapchat.android", "com.discord",
+            "com.linkedin.android", "com.microsoft.teams", "com.Slack", "com.truecaller"
+        )
+
+        fun isEnabled(ctx: Context): Boolean {
+            val s = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners") ?: return false
+            return s.contains(ctx.packageName)
+        }
+
+        fun clearPkg(pkg: String) {
+            val i = instance ?: return
+            val g = groups.firstOrNull { it.pkg == pkg } ?: return
+            try { i.cancelNotifications(g.keys.toTypedArray()) } catch (e: Exception) { }
+            groups = groups.filter { it.pkg != pkg }
+            i.fire()
+        }
+
+        fun clearAll() {
+            val i = instance ?: return
+            try { i.cancelAllNotifications() } catch (e: Exception) { }
+            groups = emptyList()
+            i.fire()
+        }
+    }
+
+    override fun onListenerConnected() {
+        instance = this
+        rebuild()
+    }
+
+    override fun onListenerDisconnected() {
+        instance = null
+        groups = emptyList()
+        fire()
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) = rebuild()
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) = rebuild()
+
+    fun fire() {
+        val cb = onChange ?: return
+        Handler(Looper.getMainLooper()).post { cb() }
+    }
+
+    private fun labelOf(pkg: String): String = try {
+        @Suppress("DEPRECATION")
+        val ai = packageManager.getApplicationInfo(pkg, 0)
+        packageManager.getApplicationLabel(ai).toString()
+    } catch (e: Exception) {
+        AppRepo.byPkg(pkg)?.label ?: pkg
+    }
+
+    private fun rebuild() {
+        val arr = try { activeNotifications } catch (e: Exception) { null } ?: return
+        val map = LinkedHashMap<String, AppNotifs>()
+        val summaries = ArrayList<StatusBarNotification>()
+        for (sbn in arr.sortedByDescending { it.postTime }) {
+            val n = sbn.notification ?: continue
+            if (sbn.packageName == packageName || !sbn.isClearable) continue
+            if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) { summaries.add(sbn); continue }
+            if (n.category == Notification.CATEGORY_TRANSPORT || n.category == Notification.CATEGORY_PROGRESS) continue
+            val ex = n.extras ?: continue
+            val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+            val text = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+            val g = map.getOrPut(sbn.packageName) {
+                AppNotifs(sbn.packageName, labelOf(sbn.packageName)).also { it.intent = n.contentIntent }
+            }
+            g.keys.add(sbn.key)
+            if (sbn.packageName in MESSAGING || n.category == Notification.CATEGORY_MESSAGE) g.messaging = true
+            val lines = ArrayList<String>()
+            @Suppress("DEPRECATION")
+            val msgs = ex.getParcelableArray(Notification.EXTRA_MESSAGES)
+            if (msgs != null && msgs.isNotEmpty()) {
+                for (p in msgs) {
+                    val b = p as? Bundle ?: continue
+                    val t = b.getCharSequence("text")?.toString() ?: continue
+                    val s = b.getCharSequence("sender")?.toString()
+                    lines.add(if (s.isNullOrEmpty() || s == title) t else "$s: $t")
+                }
+            } else {
+                val tl = ex.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+                if (tl != null && tl.isNotEmpty()) {
+                    for (l in tl) lines.add(l.toString())
+                } else if (text.isNotEmpty()) {
+                    lines.add(text)
+                }
+            }
+            if (title.isNotEmpty() || lines.isNotEmpty()) g.chats.add(NotifChat(title.ifEmpty { g.label }, lines))
+        }
+        for (s in summaries) map[s.packageName]?.keys?.add(s.key)
+        groups = map.values.filter { it.chats.isNotEmpty() }
+        fire()
+    }
+}
+
+object Media {
+    /** The music session that is playing right now, or null. Needs notification access. */
+    fun playing(ctx: Context): MediaController? {
+        if (!BubbleNotifListener.isEnabled(ctx)) return null
+        return try {
+            val msm = ctx.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val list = msm.getActiveSessions(ComponentName(ctx, BubbleNotifListener::class.java))
+            list.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+        } catch (e: Exception) {
+            null
+        }
+    }
+}
+
+// ===== BubbleView (the robot in the glass sphere) =====
 class BubbleView(ctx: Context) : View(ctx) {
+    enum class Mood { IDLE, SLEEP, HAPPY, SURPRISED, DIZZY, MUSIC, WINK }
+
+    companion object {
+        const val SLEEP_MS = 10000L
+        val ACT_MS = floatArrayOf(1600f, 1400f, 1000f, 1800f, 1400f, 1800f)
+    }
+
     private val d = resources.displayMetrics.density
     private val aa = Paint.ANTI_ALIAS_FLAG
-    private val base = Paint(aa).apply { color = Color.argb(110, 20, 16, 40) }
-    private val glass = Paint(aa)
-    private val edge = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 1.2f * d; color = Color.argb(190, 255, 255, 255) }
-    private val ring = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 2.6f * d; color = Color.argb(235, 255, 255, 255) }
-    private val glow = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 7f * d; color = Color.argb(45, 255, 255, 255) }
-    private val hl = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 1.6f * d; strokeCap = Paint.Cap.ROUND; color = Color.argb(170, 255, 255, 255) }
+    private val fill = Paint(aa)
+    private val stroke = Paint(aa).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+    private val textP = Paint(aa).apply { textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD }
     private val rect = RectF()
-    private var pressedLook = false
+    private val path = Path()
+    private val rnd = java.util.Random()
 
-    fun setPressedLook(v: Boolean) {
-        if (pressedLook != v) { pressedLook = v; invalidate() }
+    private val metal = Color.rgb(205, 202, 234)
+    private val eyeOn = Color.rgb(110, 240, 215)
+
+    var menuOpen = false
+        set(v) { field = v; lastActive = SystemClock.uptimeMillis(); invalidate() }
+    var dragging = false
+        set(v) { field = v; lastActive = SystemClock.uptimeMillis(); invalidate() }
+    var musicOn = false
+        set(v) { if (field != v) { field = v; invalidate() } }
+    var badge = false
+        set(v) { if (field != v) { field = v; invalidate() } }
+    var pressedLook = false
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    private var lastActive = SystemClock.uptimeMillis()
+    private var temp: Mood? = null
+    private var tempUntil = 0L
+    private var action = -1
+    private var actionStart = 0L
+    private var nextAction = SystemClock.uptimeMillis() + 2500
+    private var nextBlink = SystemClock.uptimeMillis() + 2000
+
+    /** Called on any touch: wakes the robot up (with a surprised face if it was asleep). */
+    fun touch() {
+        val now = SystemClock.uptimeMillis()
+        val asleep = mood(now) == Mood.SLEEP
+        lastActive = now
+        if (asleep) flash(Mood.SURPRISED, 700) else invalidate()
+    }
+
+    fun flash(m: Mood, ms: Long) {
+        val now = SystemClock.uptimeMillis()
+        temp = m
+        tempUntil = now + ms
+        lastActive = now
+        invalidate()
+    }
+
+    private fun mood(now: Long): Mood {
+        val t = temp
+        if (t != null && now < tempUntil) return t
+        if (dragging) return Mood.DIZZY
+        if (menuOpen) return Mood.HAPPY
+        if (musicOn) return Mood.MUSIC
+        if (now - lastActive > SLEEP_MS) return Mood.SLEEP
+        return Mood.IDLE
     }
 
     override fun onDraw(c: Canvas) {
         super.onDraw(c)
+        val now = SystemClock.uptimeMillis()
+        val ts = (now % 600000L) / 1000f
+        val m = mood(now)
         val cx = width / 2f
         val cy = height / 2f
-        val r = min(cx, cy) - 2 * d
-        val s = if (pressedLook) 0.86f else 1f
+        val r = min(cx, cy) - 5 * d
+        val s = if (pressedLook) 0.9f else 1f
+        val sleep = m == Mood.SLEEP
         c.save()
         c.scale(s, s, cx, cy)
-        c.drawCircle(cx, cy, r, base)
-        glass.shader = LinearGradient(cx - r, cy - r, cx + r, cy + r,
-            Color.argb(120, 255, 255, 255), Color.argb(30, 255, 255, 255), Shader.TileMode.CLAMP)
-        c.drawCircle(cx, cy, r, glass)
-        c.drawCircle(cx, cy, r, edge)
-        rect.set(cx - r + 3 * d, cy - r + 3 * d, cx + r - 3 * d, cy + r - 3 * d)
-        c.drawArc(rect, 200f, 70f, false, hl)
-        val ir = r * 0.45f
-        c.drawCircle(cx, cy, ir, glow)
-        c.drawCircle(cx, cy, ir, ring)
+
+        // sphere interior
+        fill.shader = RadialGradient(
+            cx - r * 0.3f, cy - r * 0.4f, r * 1.6f,
+            if (sleep) Color.argb(215, 40, 36, 70) else Color.argb(205, 74, 66, 128),
+            if (sleep) Color.argb(230, 12, 10, 24) else Color.argb(220, 20, 18, 40),
+            Shader.TileMode.CLAMP
+        )
+        c.drawCircle(cx, cy, r, fill)
+        fill.shader = null
+
+        c.save()
+        path.reset()
+        path.addCircle(cx, cy, r - d, Path.Direction.CW)
+        c.clipPath(path)
+        drawRobot(c, cx, cy, r, m, now, ts)
         c.restore()
+
+        // glass on top
+        fill.shader = LinearGradient(cx, cy - r, cx, cy + r,
+            intArrayOf(Color.argb(70, 255, 255, 255), Color.argb(0, 255, 255, 255), Color.argb(30, 255, 255, 255)),
+            floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP)
+        c.drawCircle(cx, cy, r, fill)
+        fill.shader = null
+        rect.set(cx - r + 3 * d, cy - r + 3 * d, cx + r - 3 * d, cy + r - 3 * d)
+        stroke.strokeWidth = 2.2f * d
+        stroke.color = Color.argb(175, 255, 255, 255)
+        c.drawArc(rect, 200f, 65f, false, stroke)
+        fill.color = Color.argb(210, 255, 255, 255)
+        c.drawCircle(cx - r * 0.42f, cy - r * 0.58f, 1.6f * d, fill)
+        stroke.strokeWidth = 1.2f * d
+        stroke.color = Color.argb(160, 255, 255, 255)
+        c.drawCircle(cx, cy, r, stroke)
+
+        if (badge) {
+            val pulse = 1f + 0.12f * sin(ts * 6f)
+            val bx = cx + r * 0.72f
+            val by = cy - r * 0.72f
+            fill.color = Color.rgb(255, 59, 48)
+            c.drawCircle(bx, by, 5.5f * d * pulse, fill)
+            stroke.strokeWidth = 1.5f * d
+            stroke.color = Color.WHITE
+            c.drawCircle(bx, by, 5.5f * d * pulse, stroke)
+        }
+        c.restore()
+
+        when (m) {
+            Mood.SLEEP -> postInvalidateDelayed(90)
+            else -> postInvalidateDelayed(33)
+        }
+    }
+
+    private fun drawArm(c: Canvas, sx: Float, sy: Float, side: Float, raise: Float, wig: Float, r: Float) {
+        val a = Math.toRadians(35.0 + 115.0 * raise + wig).toFloat()
+        val len = 0.3f * r
+        val ex = sx + side * sin(a) * len
+        val ey = sy + cos(a) * len
+        c.drawLine(sx, sy, ex, ey, stroke)
+        c.drawCircle(ex, ey, 0.07f * r, fill)
+    }
+
+    private fun drawRobot(c: Canvas, cx: Float, cy: Float, r: Float, m: Mood, now: Long, ts: Float) {
+        val pi = PI.toFloat()
+        var ox = 0f
+        var oy = 0f
+        var rot = 0f
+        var lookX = 0f
+        var armL = 0f
+        var armR = 0f
+        var wig = 0f
+        var yawn = 0f
+        var knock = -1f
+
+        if (m == Mood.IDLE) {
+            if (action < 0 && now > nextAction) { action = rnd.nextInt(6); actionStart = now }
+            if (action >= 0) {
+                val p = (now - actionStart) / ACT_MS[action]
+                if (p >= 1f) {
+                    action = -1
+                    nextAction = now + 3000 + rnd.nextInt(4000)
+                } else when (action) {
+                    0 -> lookX = sin(p * 2f * pi) * 0.09f * r
+                    1 -> { armR = sin(p * pi); wig = sin(p * 40f) * 18f }
+                    2 -> oy = -abs(sin(p * 2f * pi)) * 0.22f * r
+                    3 -> {
+                        ox = sin(p * pi) * 0.2f * r
+                        if (p > 0.3f && p < 0.7f) { armR = 0.65f + 0.3f * abs(sin(p * 60f)); knock = (p - 0.3f) / 0.4f }
+                    }
+                    4 -> rot = sin(p * 2f * pi) * 14f
+                    5 -> yawn = sin(p * pi)
+                }
+            }
+            oy += sin(ts * 2f) * 0.03f * r
+        } else {
+            action = -1
+        }
+        when (m) {
+            Mood.SLEEP -> { oy += sin(ts * 1.2f) * 0.05f * r + 0.06f * r; rot = 8f }
+            Mood.MUSIC -> { oy -= abs(sin(ts * pi * 2.2f)) * 0.1f * r; rot = sin(ts * pi * 1.1f) * 9f; armL = 0.5f + 0.3f * sin(ts * 7f); armR = 0.5f - 0.3f * sin(ts * 7f) }
+            Mood.DIZZY -> { rot = sin(ts * 12f) * 12f; ox = sin(ts * 9f) * 0.05f * r }
+            Mood.HAPPY -> { oy -= abs(sin(ts * 5f)) * 0.05f * r; armL = 0.8f; armR = 0.8f; wig = sin(ts * 14f) * 8f }
+            Mood.SURPRISED -> { oy -= 0.08f * r; armL = 0.6f; armR = 0.6f }
+            Mood.WINK -> { armR = 0.9f; wig = sin(ts * 20f) * 15f }
+            Mood.IDLE -> { }
+        }
+
+        // blink timer
+        var blink = false
+        if (now > nextBlink) {
+            if (now > nextBlink + 130) nextBlink = now + 2500 + rnd.nextInt(2500) else blink = true
+        }
+
+        val hx = cx + ox
+        val hy = cy + oy + 0.08f * r
+        val hw = 0.88f * r
+        val hh = 0.64f * r
+        c.save()
+        c.rotate(rot, hx, hy)
+
+        // body + arms
+        fill.color = metal
+        rect.set(hx - 0.3f * r, hy + hh * 0.42f, hx + 0.3f * r, hy + hh * 0.42f + 0.42f * r)
+        c.drawRoundRect(rect, 0.12f * r, 0.12f * r, fill)
+        stroke.strokeWidth = 0.09f * r
+        stroke.color = metal
+        drawArm(c, hx - 0.3f * r, hy + hh * 0.62f, -1f, armL, -wig * 0.3f, r)
+        drawArm(c, hx + 0.3f * r, hy + hh * 0.62f, 1f, armR, wig, r)
+
+        // antenna
+        val top = hy - hh / 2f
+        val wob = sin(ts * 3f) * 0.06f * r
+        stroke.strokeWidth = 0.05f * r
+        c.drawLine(hx, top, hx + wob, top - 0.24f * r, stroke)
+        fill.color = when {
+            badge -> if (sin(ts * 8f) > 0f) Color.rgb(255, 59, 48) else Color.rgb(140, 30, 30)
+            m == Mood.SLEEP -> Color.rgb(90, 88, 110)
+            m == Mood.MUSIC -> Color.HSVToColor(floatArrayOf((ts * 90f) % 360f, 0.6f, 1f))
+            else -> eyeOn
+        }
+        c.drawCircle(hx + wob, top - 0.26f * r, 0.07f * r, fill)
+
+        // head
+        fill.shader = LinearGradient(hx, hy - hh / 2f, hx, hy + hh / 2f, Color.rgb(246, 245, 255), Color.rgb(192, 188, 226), Shader.TileMode.CLAMP)
+        rect.set(hx - hw / 2f, hy - hh / 2f, hx + hw / 2f, hy + hh / 2f)
+        c.drawRoundRect(rect, 0.22f * r, 0.22f * r, fill)
+        fill.shader = null
+        fill.color = Color.rgb(170, 165, 215)
+        rect.set(hx - hw / 2f - 0.07f * r, hy - 0.1f * r, hx - hw / 2f + 0.02f * r, hy + 0.1f * r)
+        c.drawRoundRect(rect, 0.04f * r, 0.04f * r, fill)
+        rect.set(hx + hw / 2f - 0.02f * r, hy - 0.1f * r, hx + hw / 2f + 0.07f * r, hy + 0.1f * r)
+        c.drawRoundRect(rect, 0.04f * r, 0.04f * r, fill)
+
+        // headphones while music plays
+        if (m == Mood.MUSIC) {
+            stroke.color = Color.rgb(83, 74, 183)
+            stroke.strokeWidth = 0.08f * r
+            rect.set(hx - hw / 2f - 0.02f * r, hy - hh / 2f - 0.18f * r, hx + hw / 2f + 0.02f * r, hy + 0.3f * r)
+            c.drawArc(rect, 200f, 140f, false, stroke)
+            fill.color = Color.rgb(83, 74, 183)
+            rect.set(hx - hw / 2f - 0.12f * r, hy - 0.14f * r, hx - hw / 2f + 0.05f * r, hy + 0.14f * r)
+            c.drawRoundRect(rect, 0.06f * r, 0.06f * r, fill)
+            rect.set(hx + hw / 2f - 0.05f * r, hy - 0.14f * r, hx + hw / 2f + 0.12f * r, hy + 0.14f * r)
+            c.drawRoundRect(rect, 0.06f * r, 0.06f * r, fill)
+        }
+
+        // face screen
+        fill.color = Color.rgb(30, 26, 60)
+        rect.set(hx - hw / 2f + 0.09f * r, hy - hh / 2f + 0.09f * r, hx + hw / 2f - 0.09f * r, hy + hh / 2f - 0.09f * r)
+        c.drawRoundRect(rect, 0.15f * r, 0.15f * r, fill)
+
+        // eyes
+        val eyeCol = if (m == Mood.SLEEP) Color.rgb(70, 140, 130) else eyeOn
+        fill.color = eyeCol
+        stroke.color = eyeCol
+        stroke.strokeWidth = 0.055f * r
+        val ey = hy - 0.03f * r
+        for (side in intArrayOf(-1, 1)) {
+            val ex = hx + side * 0.19f * r + lookX
+            val kind = when (m) {
+                Mood.SLEEP -> 1
+                Mood.HAPPY, Mood.MUSIC -> 2
+                Mood.SURPRISED -> 3
+                Mood.DIZZY -> 4
+                Mood.WINK -> if (side < 0) 2 else 0
+                Mood.IDLE -> 0
+            }
+            when (kind) {
+                0 -> {
+                    var eh = if (blink) 0.03f * r else 0.2f * r
+                    eh *= (1f - 0.7f * yawn)
+                    rect.set(ex - 0.065f * r, ey - eh / 2f, ex + 0.065f * r, ey + eh / 2f)
+                    c.drawRoundRect(rect, 0.05f * r, 0.05f * r, fill)
+                }
+                1 -> { rect.set(ex - 0.08f * r, ey - 0.08f * r, ex + 0.08f * r, ey + 0.06f * r); c.drawArc(rect, 20f, 140f, false, stroke) }
+                2 -> { rect.set(ex - 0.08f * r, ey - 0.04f * r, ex + 0.08f * r, ey + 0.12f * r); c.drawArc(rect, 200f, 140f, false, stroke) }
+                3 -> c.drawCircle(ex, ey, 0.1f * r, fill)
+                4 -> {
+                    val k = 0.065f * r
+                    c.drawLine(ex - k, ey - k, ex + k, ey + k, stroke)
+                    c.drawLine(ex - k, ey + k, ex + k, ey - k, stroke)
+                }
+            }
+        }
+
+        // mouth
+        val my = hy + 0.15f * r
+        when (m) {
+            Mood.IDLE -> if (yawn > 0.05f) {
+                rect.set(hx - 0.05f * r, my - 0.06f * r * yawn, hx + 0.05f * r, my + 0.06f * r * yawn)
+                c.drawOval(rect, fill)
+            } else {
+                rect.set(hx - 0.09f * r, my - 0.07f * r, hx + 0.09f * r, my + 0.03f * r)
+                c.drawArc(rect, 20f, 140f, false, stroke)
+            }
+            Mood.SLEEP -> c.drawCircle(hx, my, 0.035f * r, fill)
+            Mood.HAPPY, Mood.MUSIC, Mood.WINK -> {
+                rect.set(hx - 0.1f * r, my - 0.07f * r, hx + 0.1f * r, my + 0.07f * r)
+                c.drawArc(rect, 0f, 180f, true, fill)
+            }
+            Mood.SURPRISED -> c.drawCircle(hx, my + 0.01f * r, 0.055f * r, stroke)
+            Mood.DIZZY -> {
+                path.reset()
+                path.moveTo(hx - 0.1f * r, my)
+                path.quadTo(hx - 0.05f * r, my - 0.05f * r, hx, my)
+                path.quadTo(hx + 0.05f * r, my + 0.05f * r, hx + 0.1f * r, my)
+                c.drawPath(path, stroke)
+            }
+        }
+        if (m == Mood.HAPPY || m == Mood.MUSIC || m == Mood.WINK) {
+            fill.color = Color.argb(150, 255, 120, 160)
+            c.drawCircle(hx - 0.3f * r, hy + 0.08f * r, 0.05f * r, fill)
+            c.drawCircle(hx + 0.3f * r, hy + 0.08f * r, 0.05f * r, fill)
+        }
+        c.restore()
+
+        // floating extras
+        when (m) {
+            Mood.SLEEP -> for (k in 0..2) {
+                val ph = (ts * 0.45f + k / 3f) % 1f
+                textP.textSize = (0.2f + ph * 0.22f) * r
+                textP.color = Color.argb((230 * (1f - ph)).toInt(), 255, 255, 255)
+                c.drawText("z", hx + 0.25f * r + ph * 0.3f * r, top - ph * 0.55f * r, textP)
+            }
+            Mood.MUSIC -> for (k in 0..1) {
+                val ph = (ts * 0.6f + k / 2f) % 1f
+                textP.textSize = 0.32f * r
+                textP.color = Color.argb((240 * (1f - ph)).toInt(), 140, 230, 255)
+                val nx = hx + (if (k == 0) -0.45f else 0.45f) * r + sin(ph * 6f) * 0.06f * r
+                c.drawText("♪", nx, top + 0.1f * r - ph * 0.6f * r, textP)
+            }
+            Mood.DIZZY -> for (k in 0..2) {
+                val a = ts * 6f + k * 2.094f
+                fill.color = Color.rgb(255, 214, 90)
+                c.drawCircle(hx + cos(a) * 0.45f * r, top - 0.05f * r + sin(a) * 0.12f * r, 0.05f * r, fill)
+            }
+            else -> { }
+        }
+        if (knock >= 0f) {
+            stroke.strokeWidth = 0.04f * r
+            stroke.color = Color.argb((200 * (1f - knock)).toInt(), 255, 255, 255)
+            c.drawCircle(cx + 0.85f * r, hy, 0.1f * r + knock * 0.25f * r, stroke)
+        }
     }
 }
 
 // ===== RadialMenuView =====
 /**
- * Full-screen overlay that draws the glass 300-degree rings and follows the thumb.
- * The touch stream comes from the bubble window (the thumb never lifts), and is fed in via thumbRaw().
+ * Full-screen overlay that draws the smoky-glass 300-degree rings.
+ * Gesture mode: the touch stream comes from the bubble (thumb never lifts) via thumbRaw()/release().
+ * Tap mode: the window is touchable and taps are handled in onTouchEvent().
  */
 @SuppressLint("ViewConstructor")
 class RadialMenuView(
@@ -431,25 +883,33 @@ class RadialMenuView(
     private val hap: Haptics,
     private val rootItems: () -> List<Item>,
     private val customItems: () -> List<Item>,
+    private val notifItems: () -> List<Item>,
     private val listener: Listener
 ) : View(ctx) {
 
     interface Listener {
         fun onLaunch(app: AppEntry)
+        fun onOpenNotif(g: AppNotifs)
         fun onClosed()
+        fun onWantTouch()
     }
 
-    enum class Kind { FOLDER, CAT, APP, MORE, EMPTY }
+    enum class Kind { FOLDER, CAT, APP, MORE, PREV, EMPTY, NOTIF, CLEAR_ALL }
 
     class Item(
         val kind: Kind,
         val label: String,
         val emoji: String = "",
         val app: AppEntry? = null,
-        val apps: (() -> List<AppEntry>)? = null
+        val apps: (() -> List<AppEntry>)? = null,
+        val notif: AppNotifs? = null,
+        val icon: Drawable? = null
     )
 
-    private class Frame(val items: List<Item>, val title: String, val radius: Float, val labels: Boolean, val root: Boolean) {
+    private class Frame(
+        var items: List<Item>, val title: String, val radius: Float, val labels: Boolean,
+        val root: Boolean, val music: Boolean, val notif: Boolean
+    ) {
         var page = 0
         var np = 1
         var vis: List<Item> = emptyList()
@@ -463,7 +923,7 @@ class RadialMenuView(
     private class Ring(
         val f: Frame, val vis: List<Item>, val cx: Float, val cy: Float, val radius: Float,
         val base: Float, val step: Float, val backX: Float, val backY: Float,
-        val labels: Boolean, val root: Boolean, val np: Int, val page: Int,
+        val labels: Boolean, val root: Boolean, val np: Int, val page: Int, val music: Boolean,
         val ox: Float, val oy: Float, val born: Long
     ) {
         var dying = 0L
@@ -476,6 +936,8 @@ class RadialMenuView(
     private val d = resources.displayMetrics.density
     private val r1 = 120 * d
     private val r2 = 104 * d
+    private val rMusic = 135 * d
+    private val rNotif = 140 * d
     private val maxItems = 9
 
     private val stack = ArrayList<Frame>()
@@ -496,15 +958,30 @@ class RadialMenuView(
     private var dwell: Runnable? = null
     private val loc = IntArray(2)
 
+    private var tapMode = false
+    private var notifMode = false
+    private var music: MediaController? = null
+    private var musicHi = -1
+    private var cardItem: Item? = null
+    private var cardHi = -1
+    private val cardRect = RectF()
+    private val openRect = RectF()
+    private val clearRect = RectF()
+    private var flipLockX = -100000f
+    private var flipLockY = -100000f
+    private var downX = 0f
+    private var downY = 0f
+
     // ---------- paints ----------
     private val aa = Paint.ANTI_ALIAS_FLAG
-    private val tint = Paint(aa).apply { color = Color.argb(70, 25, 20, 45) }
+    private val tint = Paint(aa)
     private val glass = Paint(aa)
     private val spec = Paint(aa)
     private val solid = Paint(aa)
+    private val artP = Paint(aa or Paint.FILTER_BITMAP_FLAG)
     private val edge = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 1.5f * d }
-    private val rimWide = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 7f * d }
     private val rimThin = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 1.5f * d; strokeCap = Paint.Cap.ROUND }
+    private val prog = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 5f * d; strokeCap = Paint.Cap.ROUND }
     private val bandStroke = Paint(aa).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
     private val lineP = Paint(aa).apply { style = Paint.Style.STROKE; strokeWidth = 2.4f * d; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
     private val emojiP = Paint(aa).apply { textAlign = Paint.Align.CENTER }
@@ -514,42 +991,65 @@ class RadialMenuView(
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         setShadowLayer(4f * d, 0f, 1f * d, Color.argb(170, 0, 0, 0))
     }
+    private val titleP = TextPaint(aa).apply { textAlign = Paint.Align.CENTER; color = Color.WHITE; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL) }
+    private val subP = TextPaint(aa).apply { textAlign = Paint.Align.CENTER; color = Color.WHITE }
+    private val headL = TextPaint(aa).apply { textAlign = Paint.Align.LEFT; color = Color.WHITE }
+    private val boldL = TextPaint(aa).apply { textAlign = Paint.Align.LEFT; color = Color.WHITE; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL) }
+    private val bodyL = TextPaint(aa).apply { textAlign = Paint.Align.LEFT; color = Color.WHITE }
+    private val btnP = TextPaint(aa).apply { textAlign = Paint.Align.CENTER; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL) }
     private val arcPath = Path()
     private val bandPath = Path()
+    private val clip = Path()
     private val rect = RectF()
-    private val transparentWhite = Color.argb(0, 255, 255, 255)
 
     // ---------- public API (called by the service) ----------
 
-    fun openRaw(rawX: Float, rawY: Float, homeRawX: Float, homeRawY: Float) {
+    fun openRaw(rawX: Float, rawY: Float, homeRawX: Float, homeRawY: Float, notif: Boolean, tap: Boolean, mc: MediaController?) {
         tx = rawX; ty = rawY; homeX = homeRawX; homeY = homeRawY
+        notifMode = notif
+        tapMode = tap
+        music = if (notif) null else mc
         pending = true
         if (width > 0) startPending()
     }
 
     fun thumbRaw(rawX: Float, rawY: Float) {
-        if (closing) return
+        if (closing || tapMode) return
         if (!started) { tx = rawX; ty = rawY; return }
         getLocationOnScreen(loc)
         thumb(rawX - loc[0], rawY - loc[1])
     }
 
+    /** Thumb lifted at the end of a hold-and-swipe gesture. */
     fun release() {
-        if (closing) return
-        closing = true
+        if (closing || tapMode) return
         cancelDwell()
         val r = cur
-        val item = if (r != null && hi >= 0 && hi < r.vis.size) r.vis[hi] else null
-        val app = item?.app
-        if (r != null && item != null && item.kind == Kind.APP && app != null) {
-            sfx.play("launch"); hap.heavy()
-            dismissCurrent(r.cx, r.cy, hi)
-            listener.onLaunch(app)
-        } else {
-            sfx.play("close"); hap.tick()
-            dismissCurrent(homeX, homeY, -1)
+        if (r == null) { close(); return }
+        if (musicHi >= 0) {
+            musicAction(musicHi)
+            toTap()
+            return
         }
-        postDelayed({ listener.onClosed() }, 460)
+        val ci = cardItem
+        val cg = ci?.notif
+        if (r.f.notif && cg != null && cardHi >= 0) {
+            if (cardHi == 0) openNotif(r, cg) else { clearNotif(r, cg); toTap() }
+            return
+        }
+        val item = if (hi >= 0 && hi < r.vis.size) r.vis[hi] else null
+        if (item == null) { close(); return }
+        when (item.kind) {
+            Kind.APP -> { val app = item.app; if (app != null) launchApp(r, app) else close() }
+            Kind.NOTIF -> { val g = item.notif; if (g != null) openNotif(r, g) else close() }
+            Kind.CLEAR_ALL -> { BubbleNotifListener.clearAll(); close() }
+            else -> close()
+        }
+    }
+
+    /** Close from outside (e.g. the bubble was tapped again). */
+    fun closeFromOutside() {
+        if (!closing) close()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -563,7 +1063,15 @@ class RadialMenuView(
         getLocationOnScreen(loc)
         tx -= loc[0]; ty -= loc[1]; homeX -= loc[0]; homeY -= loc[1]
         stack.clear()
-        pushRing(rootItems(), tx, ty, null, null, r1, true, "")
+        val px = if (tapMode) homeX else tx
+        val py = if (tapMode) homeY else ty
+        val items = if (notifMode) notifItems() else rootItems()
+        val rad = when {
+            notifMode -> rNotif
+            music != null -> rMusic
+            else -> r1
+        }
+        pushRing(items, px, py, null, null, rad, true, if (notifMode) "Notifications" else "", music != null, notifMode)
     }
 
     // ---------- ring logic ----------
@@ -574,41 +1082,55 @@ class RadialMenuView(
     private fun clampF(v: Float, lo: Float, hi: Float) = if (hi < lo) (lo + hi) / 2f else v.coerceIn(lo, hi)
     private fun argbW(a: Float) = Color.argb(a.toInt().coerceIn(0, 255), 255, 255, 255)
     private fun ang(r: Ring, i: Int) = rad(r.base + r.step * (i + 0.5f))
+    private fun ellip(s: String, p: TextPaint, w: Float) = TextUtils.ellipsize(s, p, w, TextUtils.TruncateAt.END).toString()
 
-    private fun pushRing(items: List<Item>, px: Float, py: Float, fromX: Float?, fromY: Float?, radius: Float, labels: Boolean, title: String) {
-        val f = Frame(items, title, radius, labels, stack.isEmpty())
+    private fun pushRing(
+        items: List<Item>, px: Float, py: Float, fromX: Float?, fromY: Float?, radius: Float,
+        labels: Boolean, title: String, musicF: Boolean, notifF: Boolean
+    ) {
+        val f = Frame(items, title, radius, labels, stack.isEmpty(), musicF, notifF)
         val m = radius + 46 * d
         f.cx = clampF(px, m, width - m)
         f.cy = clampF(py, m, height - m)
         val dist = hypot(px - f.cx, py - f.cy)
         if (dist > 30 * d) {
-            // Ring was pushed away from a screen edge: put the gap (and back button) right under the thumb.
+            // Ring was pushed away from a screen edge: the gap (and back button) sits right under the thumb.
             f.gap = deg(atan2(py - f.cy, px - f.cx))
             f.backX = px; f.backY = py
         } else {
             f.gap = if (fromX != null && fromY != null) deg(atan2(fromY - f.cy, fromX - f.cx)) else 90f
             f.backX = f.cx; f.backY = f.cy
+            if (musicF || notifF) {
+                // keep the centre free for the music player / message card
+                val a = rad(f.gap)
+                f.backX = f.cx + radius * cos(a); f.backY = f.cy + radius * sin(a)
+            }
         }
         stack.add(f)
         render(f, px, py)
     }
 
     private fun render(f: Frame, ox: Float, oy: Float) {
-        hi = -1; left = false; armed = false; armX = tx; armY = ty
+        hi = -1; left = false; armed = false; armX = tx; armY = ty; musicHi = -1; cardHi = -1
+        if (!f.notif) cardItem = null
         cancelDwell()
         val n = f.items.size
         if (n > maxItems) {
-            val per = maxItems - 1
+            val per = maxItems - 2
             f.np = (n + per - 1) / per
-            if (f.page >= f.np) f.page = 0
+            f.page = f.page.coerceIn(0, f.np - 1)
             val s = f.page * per
-            f.vis = f.items.subList(s, min(n, s + per)) + Item(Kind.MORE, "More")
+            val list = ArrayList<Item>()
+            if (f.page > 0) list.add(Item(Kind.PREV, "Previous", "‹"))
+            list.addAll(f.items.subList(s, min(n, s + per)))
+            if (f.page < f.np - 1) list.add(Item(Kind.MORE, "Next", "›"))
+            f.vis = list
         } else {
             f.np = 1; f.page = 0; f.vis = f.items
         }
         val step = 300f / f.vis.size
         val r = Ring(f, f.vis, f.cx, f.cy, f.radius, f.gap + 30f, step, f.backX, f.backY,
-            f.labels, f.root, f.np, f.page, ox, oy, now())
+            f.labels, f.root, f.np, f.page, f.music && music != null, ox, oy, now())
         rings.add(r)
         cur = r
         invalidate()
@@ -631,10 +1153,48 @@ class RadialMenuView(
         return min(r.vis.size - 1, (rel / r.step).toInt())
     }
 
+    private fun pickTap(r: Ring, x: Float, y: Float): Int {
+        for (i in r.vis.indices) {
+            val a = ang(r, i)
+            if (hypot(x - (r.cx + r.radius * cos(a)), y - (r.cy + r.radius * sin(a))) < 30 * d) return i
+        }
+        return -1
+    }
+
+    private fun musicRadius(r: Ring) = r.radius - 40 * d
+    private fun inMusic(r: Ring, x: Float, y: Float) = r.music && music != null && hypot(x - r.cx, y - r.cy) < musicRadius(r)
+    private fun ctrlX(r: Ring, i: Int) = r.cx + (i - 1) * 44 * d
+    private fun ctrlY(r: Ring) = r.cy + musicRadius(r) * 0.5f
+
+    private fun musicControlAt(r: Ring, x: Float, y: Float): Int {
+        for (i in 0..2) if (hypot(x - ctrlX(r, i), y - ctrlY(r)) < 22 * d) return i
+        return -1
+    }
+
     private fun thumb(x: Float, y: Float) {
         tx = x; ty = y
         val r = cur ?: return
         if (!armed && hypot(x - armX, y - armY) > 30 * d) armed = true
+
+        // music player in the centre
+        if (inMusic(r, x, y)) {
+            val mh = musicControlAt(r, x, y)
+            if (mh != musicHi) { musicHi = mh; if (mh >= 0) { sfx.play("tick"); hap.tick() }; invalidate() }
+            if (hi != -1) { hi = -1; cancelDwell(); invalidate() }
+            return
+        } else if (musicHi != -1) {
+            musicHi = -1; invalidate()
+        }
+
+        // message card in the centre
+        if (r.f.notif && cardItem != null && cardRect.contains(x, y)) {
+            val ch = if (openRect.contains(x, y)) 0 else if (clearRect.contains(x, y)) 1 else -1
+            if (ch != cardHi) { cardHi = ch; if (ch >= 0) { sfx.play("tick"); hap.tick() }; invalidate() }
+            return
+        } else if (cardHi != -1) {
+            cardHi = -1; invalidate()
+        }
+
         val dB = hypot(x - r.backX, y - r.backY)
         if (dB > 45 * d) left = true
         if (!r.root && left && dB < 24 * d) { pop(); return }
@@ -642,16 +1202,21 @@ class RadialMenuView(
         if (p != hi) {
             hi = p
             cancelDwell()
-            if (p >= 0) { sfx.play("tick"); hap.tick() }
+            if (p >= 0) {
+                sfx.play("tick"); hap.tick()
+                val it2 = r.vis[p]
+                if (it2.kind == Kind.NOTIF) cardItem = it2
+            }
             invalidate()
         }
         if (hi < 0) return
         val item = r.vis[hi]
         when (item.kind) {
-            Kind.MORE -> if (dwell == null) {
-                val run = Runnable { dwell = null; flip(r.f) }
+            Kind.MORE, Kind.PREV -> if (dwell == null && hypot(x - flipLockX, y - flipLockY) > 36 * d) {
+                val dir = if (item.kind == Kind.MORE) 1 else -1
+                val run = Runnable { dwell = null; flip(r.f, dir) }
                 dwell = run
-                postDelayed(run, 450)
+                postDelayed(run, 550)
             }
             Kind.CAT, Kind.FOLDER -> if (armed) {
                 val a = ang(r, hi)
@@ -665,21 +1230,29 @@ class RadialMenuView(
         }
     }
 
-    private fun flip(f: Frame) {
+    /** One page per hold. To flip again, slide off the arrow and back on. */
+    private fun flip(f: Frame, dir: Int) {
         if (closing || cur?.f !== f) return
         sfx.play("page"); hap.click()
+        flipLockX = tx; flipLockY = ty
         dismissCurrent(f.cx, f.cy, -1)
-        f.page = (f.page + 1) % f.np
+        f.page = (f.page + dir).coerceIn(0, max(0, f.np - 1))
         render(f, f.cx, f.cy)
         armed = true
     }
 
     private fun openChild(r: Ring, item: Item, x: Float, y: Float) {
         sfx.play("sub"); hap.click()
-        dismissCurrent(x, y, -1)
         val folder = item.kind == Kind.FOLDER
         val items = if (folder) customItems() else appItems(item.apps?.invoke() ?: emptyList())
-        pushRing(items, x, y, r.cx, r.cy, if (folder) r1 else r2, folder, item.label)
+        val rad = if (folder) r1 else r2
+        if (tapMode) {
+            dismissCurrent(r.cx, r.cy, -1)
+            pushRing(items, r.cx, r.cy, homeX, homeY, rad, folder, item.label, false, false)
+        } else {
+            dismissCurrent(x, y, -1)
+            pushRing(items, x, y, r.cx, r.cy, rad, folder, item.label, false, false)
+        }
     }
 
     private fun pop() {
@@ -694,6 +1267,121 @@ class RadialMenuView(
     private fun appItems(list: List<AppEntry>): List<Item> =
         if (list.isEmpty()) listOf(Item(Kind.EMPTY, "Empty", "＋"))
         else list.map { Item(Kind.APP, it.label, app = it) }
+
+    private fun finishLater() {
+        postDelayed({ listener.onClosed() }, 460)
+    }
+
+    private fun close() {
+        closing = true
+        cancelDwell()
+        sfx.play("close"); hap.tick()
+        cardItem = null
+        dismissCurrent(homeX, homeY, -1)
+        finishLater()
+    }
+
+    private fun launchApp(r: Ring, app: AppEntry) {
+        closing = true
+        cancelDwell()
+        sfx.play("launch"); hap.heavy()
+        dismissCurrent(r.cx, r.cy, hi)
+        listener.onLaunch(app)
+        finishLater()
+    }
+
+    private fun openNotif(r: Ring, g: AppNotifs) {
+        closing = true
+        cancelDwell()
+        sfx.play("launch"); hap.heavy()
+        cardItem = null
+        dismissCurrent(r.cx, r.cy, hi)
+        listener.onOpenNotif(g)
+        finishLater()
+    }
+
+    private fun clearNotif(r: Ring, g: AppNotifs) {
+        BubbleNotifListener.clearPkg(g.pkg)
+        sfx.play("close"); hap.click()
+        cardItem = null
+        val f = r.f
+        f.items = f.items.filter { it.notif?.pkg != g.pkg }
+        if (f.items.none { it.kind == Kind.NOTIF }) { close(); return }
+        dismissCurrent(f.cx, f.cy, -1)
+        render(f, f.cx, f.cy)
+    }
+
+    private fun musicAction(i: Int) {
+        val mc = music ?: return
+        try {
+            val tc = mc.transportControls
+            when (i) {
+                0 -> tc.skipToPrevious()
+                1 -> if (mc.playbackState?.state == PlaybackState.STATE_PLAYING) tc.pause() else tc.play()
+                2 -> tc.skipToNext()
+            }
+        } catch (e: Exception) { }
+        sfx.play("sub"); hap.click()
+        invalidate()
+    }
+
+    private fun toTap() {
+        if (!tapMode) {
+            tapMode = true
+            listener.onWantTouch()
+        }
+        invalidate()
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (!tapMode || closing) return true
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { downX = e.x; downY = e.y }
+            MotionEvent.ACTION_UP -> if (hypot(e.x - downX, e.y - downY) < 16 * d) tap(e.x, e.y)
+        }
+        return true
+    }
+
+    private fun tap(x: Float, y: Float) {
+        val r = cur ?: run { close(); return }
+        if (inMusic(r, x, y)) {
+            val mh = musicControlAt(r, x, y)
+            if (mh >= 0) {
+                musicHi = mh
+                musicAction(mh)
+                postDelayed({ musicHi = -1; invalidate() }, 200)
+            }
+            return
+        }
+        val ci = cardItem
+        val cg = ci?.notif
+        if (r.f.notif && cg != null && cardRect.contains(x, y)) {
+            if (openRect.contains(x, y)) openNotif(r, cg) else if (clearRect.contains(x, y)) clearNotif(r, cg)
+            return
+        }
+        if (hypot(x - r.backX, y - r.backY) < 26 * d) {
+            if (r.root) close() else pop()
+            return
+        }
+        val p = pickTap(r, x, y)
+        if (p < 0) {
+            if (hypot(x - r.cx, y - r.cy) > r.radius + 50 * d) close()
+            return
+        }
+        val item = r.vis[p]
+        hi = p
+        invalidate()
+        when (item.kind) {
+            Kind.CAT, Kind.FOLDER -> openChild(r, item, x, y)
+            Kind.APP -> { val app = item.app; if (app != null) launchApp(r, app) }
+            Kind.MORE -> flip(r.f, 1)
+            Kind.PREV -> flip(r.f, -1)
+            Kind.NOTIF -> { cardItem = item; sfx.play("tick"); hap.tick() }
+            Kind.CLEAR_ALL -> { BubbleNotifListener.clearAll(); close() }
+            Kind.EMPTY -> {}
+        }
+    }
 
     private fun cancelDwell() {
         dwell?.let { removeCallbacks(it) }
@@ -724,6 +1412,8 @@ class RadialMenuView(
             if (r.dying > 0 && t - r.dying > 420) itr.remove()
         }
         for (r in rings) if (drawRing(c, r, t)) anim = true
+        val r = cur
+        if (r != null && r.f.notif && cardItem != null) drawCard(c, r)
         if (anim) postInvalidateOnAnimation()
     }
 
@@ -739,12 +1429,13 @@ class RadialMenuView(
         val trayS = (0.3f + 0.7f * backOut(trayT)) * (1f - 0.6f * dieE)
         val trayA = min(1f, age / 180f) * (1f - dieT)
         drawTray(c, r, trayS, trayA)
+        if (r.music) { drawMusic(c, r, trayS, trayA); anim = true }
 
         for (i in r.vis.indices) {
             val target = if (r === cur && i == hi) 1f else 0f
             val h = r.hl[i]
             val nh = h + (target - h) * 0.35f
-            if (kotlin.math.abs(target - nh) < 0.01f) r.hl[i] = target else { r.hl[i] = nh; anim = true }
+            if (abs(target - nh) < 0.01f) r.hl[i] = target else { r.hl[i] = nh; anim = true }
         }
 
         for (i in r.vis.indices) {
@@ -780,6 +1471,20 @@ class RadialMenuView(
         return anim
     }
 
+    /** Smoky dark glass with a bright top rim, like the iOS widget glass. */
+    private fun glassPath(c: Canvas, p: Path, top: Float, bottom: Float, a: Float, h: Float) {
+        tint.color = Color.argb((165 * a).toInt().coerceIn(0, 255), 36, 36, 42)
+        c.drawPath(p, tint)
+        glass.shader = LinearGradient(0f, top, 0f, bottom,
+            intArrayOf(argbW((62 + 70 * h) * a), argbW((10 + 30 * h) * a), argbW((26 + 20 * h) * a)),
+            floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP)
+        c.drawPath(p, glass)
+        glass.shader = null
+        edge.shader = LinearGradient(0f, top, 0f, bottom, argbW((205 + 50 * h) * a), argbW(45 * a), Shader.TileMode.CLAMP)
+        c.drawPath(p, edge)
+        edge.shader = null
+    }
+
     private fun drawTray(c: Canvas, r: Ring, s: Float, a: Float) {
         if (a <= 0.01f) return
         val rIn = r.radius - 31 * d
@@ -790,7 +1495,6 @@ class RadialMenuView(
         val sweep = 300f - 2f * cap
         c.save()
         c.scale(s, s, r.cx, r.cy)
-
         rect.set(r.cx - mid, r.cy - mid, r.cx + mid, r.cy + mid)
         arcPath.reset()
         arcPath.addArc(rect, r.base + cap, sweep)
@@ -798,87 +1502,71 @@ class RadialMenuView(
         bandPath.reset()
         @Suppress("DEPRECATION")
         bandStroke.getFillPath(arcPath, bandPath)
-
-        // dark tint so the glass reads on bright screens too
-        tint.color = Color.argb((80 * a).toInt(), 25, 20, 45)
-        c.drawPath(bandPath, tint)
-        // frosted white body
-        glass.shader = LinearGradient(
-            r.cx - rOut, r.cy - rOut, r.cx + rOut, r.cy + rOut,
-            intArrayOf(argbW(105 * a), argbW(25 * a), argbW(60 * a)),
-            floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
-        )
-        c.drawPath(bandPath, glass)
-        glass.shader = null
-        // specular sheen at top-left
-        spec.shader = SweepGradient(
-            r.cx, r.cy,
-            intArrayOf(transparentWhite, transparentWhite, argbW(120 * a), transparentWhite, transparentWhite),
-            floatArrayOf(0f, 0.56f, 0.64f, 0.72f, 1f)
-        )
+        glassPath(c, bandPath, r.cy - rOut, r.cy + rOut, a, 0f)
+        // soft sheen at top-left
+        spec.shader = SweepGradient(r.cx, r.cy,
+            intArrayOf(Color.argb(0, 255, 255, 255), Color.argb(0, 255, 255, 255), argbW(70 * a), Color.argb(0, 255, 255, 255), Color.argb(0, 255, 255, 255)),
+            floatArrayOf(0f, 0.56f, 0.64f, 0.72f, 1f))
         c.drawPath(bandPath, spec)
         spec.shader = null
-        // bright outer edge
-        edge.color = argbW(175 * a)
-        c.drawPath(bandPath, edge)
-        // inner rim glow
         val ri = rIn + 3 * d
         rect.set(r.cx - ri, r.cy - ri, r.cx + ri, r.cy + ri)
-        rimWide.color = argbW(35 * a)
-        c.drawArc(rect, r.base + cap, sweep, false, rimWide)
-        rimThin.color = argbW(175 * a)
+        rimThin.color = argbW(70 * a)
         c.drawArc(rect, r.base + cap, sweep, false, rimThin)
         c.restore()
     }
 
-    private fun glassCircle(c: Canvas, x: Float, y: Float, rad: Float, a: Float, h: Float) {
-        tint.color = Color.argb((70 * a).toInt().coerceIn(0, 255), 25, 20, 45)
-        c.drawCircle(x, y, rad, tint)
-        glass.shader = LinearGradient(x - rad, y - rad, x + rad, y + rad, argbW(115 * a), argbW(25 * a), Shader.TileMode.CLAMP)
-        c.drawCircle(x, y, rad, glass)
-        glass.shader = null
-        if (h > 0f) {
-            solid.color = argbW(235 * h * a)
-            c.drawCircle(x, y, rad, solid)
-        }
-        edge.color = argbW(160 * a)
-        c.drawCircle(x, y, rad, edge)
-        val k = 3 * d
-        rect.set(x - rad + k, y - rad + k, x + rad - k, y + rad - k)
-        rimThin.color = argbW(130 * a)
-        c.drawArc(rect, 200f, 70f, false, rimThin)
+    private fun glassTile(c: Canvas, x: Float, y: Float, half: Float, a: Float, h: Float) {
+        val cr = half * 0.42f
+        rect.set(x - half, y - half, x + half, y + half)
+        clip.reset()
+        clip.addRoundRect(rect, cr, cr, Path.Direction.CW)
+        glassPath(c, clip, y - half, y + half, a, h)
     }
 
     private fun drawItem(c: Canvas, r: Ring, item: Item, x: Float, y: Float, sc: Float, a: Float, h: Float) {
         if (a <= 0.01f) return
-        val rad = 22 * d * sc
-        val app = item.app
-        if (item.kind == Kind.APP && app != null) {
-            solid.color = argbW((45 + 160 * h) * a)
-            c.drawCircle(x, y, rad + 3 * d * sc, solid)
-            val ic = app.icon
-            ic.setBounds((x - rad).toInt(), (y - rad).toInt(), (x + rad).toInt(), (y + rad).toInt())
+        val half = 23 * d * sc
+        glassTile(c, x, y, half, a, h)
+        val ic = item.app?.icon ?: item.icon
+        if (ic != null) {
+            val k = half - 5 * d * sc
+            ic.setBounds((x - k).toInt(), (y - k).toInt(), (x + k).toInt(), (y + k).toInt())
             ic.alpha = (255 * a).toInt().coerceIn(0, 255)
             ic.draw(c)
         } else {
-            glassCircle(c, x, y, rad, a, h)
-            val txt = if (item.kind == Kind.MORE) "•••" else item.emoji
-            emojiP.textSize = (if (item.kind == Kind.MORE) 14f else 20f) * d * sc
-            emojiP.color = if (h > 0.5f) Color.rgb(38, 33, 92) else Color.WHITE
+            val txt = item.emoji
+            val arrow = item.kind == Kind.MORE || item.kind == Kind.PREV
+            emojiP.textSize = (if (arrow) 30f else 20f) * d * sc
+            emojiP.color = Color.WHITE
             emojiP.alpha = (255 * a).toInt().coerceIn(0, 255)
             val fm = emojiP.fontMetrics
             c.drawText(txt, x, y - (fm.ascent + fm.descent) / 2f, emojiP)
         }
+        // unread count
+        val g = item.notif
+        if (g != null && g.count > 0) {
+            val bx = x + half * 0.8f
+            val by = y - half * 0.8f
+            solid.color = Color.argb((255 * a).toInt().coerceIn(0, 255), 255, 59, 48)
+            c.drawCircle(bx, by, 8 * d * sc, solid)
+            btnP.color = Color.WHITE
+            btnP.alpha = (255 * a).toInt().coerceIn(0, 255)
+            btnP.textSize = 10 * d * sc
+            val fm = btnP.fontMetrics
+            c.drawText(if (g.count > 9) "9+" else g.count.toString(), bx, by - (fm.ascent + fm.descent) / 2f, btnP)
+        }
         if (r.labels || h > 0.05f) {
             var label = when {
-                item.kind == Kind.MORE -> if (h > 0.05f) "Hold for next page" else ""
+                item.kind == Kind.MORE && h > 0.05f && !tapMode -> "Hold for next page"
+                item.kind == Kind.PREV && h > 0.05f && !tapMode -> "Hold for previous"
                 else -> item.label
             }
             if (label.isEmpty()) return
-            if (label.length > 14) label = label.take(13) + "…"
+            if (label.length > 18) label = label.take(17) + "…"
             labelP.textSize = 12f * d * (if (r.labels) 1f else 1.1f)
             labelP.alpha = (255 * a * (if (r.labels) 1f else h)).toInt().coerceIn(0, 255)
-            c.drawText(label, x, y + rad + 15 * d, labelP)
+            c.drawText(label, x, y + half + 15 * d, labelP)
         }
     }
 
@@ -887,7 +1575,9 @@ class RadialMenuView(
         val x = r.backX
         val y = r.backY
         val rad = 22 * d * s
-        glassCircle(c, x, y, rad, a, 0f)
+        clip.reset()
+        clip.addCircle(x, y, rad, Path.Direction.CW)
+        glassPath(c, clip, y - rad, y + rad, a, 0f)
         lineP.color = argbW(240 * a)
         val k = 6 * d * s
         if (r.root) {
@@ -909,22 +1599,168 @@ class RadialMenuView(
             }
         }
     }
+
+    private fun fmt(ms: Long): String {
+        val s = (ms / 1000).coerceAtLeast(0)
+        return String.format("%d:%02d", s / 60, s % 60)
+    }
+
+    private fun tri(c: Canvas, x: Float, y: Float, size: Float, right: Boolean, p: Paint) {
+        arcPath.reset()
+        val dir = if (right) 1f else -1f
+        arcPath.moveTo(x - dir * size * 0.5f, y - size * 0.6f)
+        arcPath.lineTo(x + dir * size * 0.55f, y)
+        arcPath.lineTo(x - dir * size * 0.5f, y + size * 0.6f)
+        arcPath.close()
+        c.drawPath(arcPath, p)
+    }
+
+    private fun drawMusic(c: Canvas, r: Ring, s: Float, a: Float) {
+        val mc = music ?: return
+        if (a <= 0.01f) return
+        val md = try { mc.metadata } catch (e: Exception) { null }
+        val st = try { mc.playbackState } catch (e: Exception) { null }
+        val mr = musicRadius(r)
+        c.save()
+        c.scale(s, s, r.cx, r.cy)
+
+        clip.reset()
+        clip.addCircle(r.cx, r.cy, mr, Path.Direction.CW)
+        tint.color = Color.argb((190 * a).toInt().coerceIn(0, 255), 30, 30, 36)
+        c.drawPath(clip, tint)
+        val art = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        if (art != null) {
+            c.save()
+            c.clipPath(clip)
+            rect.set(r.cx - mr, r.cy - mr, r.cx + mr, r.cy + mr)
+            artP.alpha = (85 * a).toInt().coerceIn(0, 255)
+            c.drawBitmap(art, null, rect, artP)
+            c.restore()
+        }
+        glassPath(c, clip, r.cy - mr, r.cy + mr, a * 0.7f, 0f)
+
+        // progress ring
+        val dur = md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+        val playing = st?.state == PlaybackState.STATE_PLAYING
+        var pos = st?.position ?: 0L
+        if (st != null && playing) pos += ((SystemClock.elapsedRealtime() - st.lastPositionUpdateTime) * st.playbackSpeed).toLong()
+        val frac = if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f
+        val pr = mr - 9 * d
+        rect.set(r.cx - pr, r.cy - pr, r.cx + pr, r.cy + pr)
+        prog.color = argbW(45 * a)
+        c.drawArc(rect, 0f, 360f, false, prog)
+        prog.color = Color.argb((255 * a).toInt().coerceIn(0, 255), 52, 199, 89)
+        if (frac > 0f) c.drawArc(rect, -90f, 360f * frac, false, prog)
+
+        // text
+        val tw = mr * 1.45f
+        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Now playing"
+        val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
+        titleP.textSize = 15 * d
+        titleP.alpha = (255 * a).toInt().coerceIn(0, 255)
+        c.drawText(ellip(title, titleP, tw), r.cx, r.cy - mr * 0.28f, titleP)
+        subP.textSize = 12 * d
+        subP.alpha = (180 * a).toInt().coerceIn(0, 255)
+        if (artist.isNotEmpty()) c.drawText(ellip(artist, subP, tw), r.cx, r.cy - mr * 0.28f + 17 * d, subP)
+        subP.textSize = 11 * d
+        subP.alpha = (150 * a).toInt().coerceIn(0, 255)
+        if (dur > 0) c.drawText(fmt(pos) + " / " + fmt(dur), r.cx, r.cy + mr * 0.14f, subP)
+
+        // controls
+        val cy = ctrlY(r)
+        for (i in 0..2) {
+            val x = ctrlX(r, i)
+            val hl = musicHi == i
+            if (i == 1) {
+                solid.color = argbW(255 * a)
+                c.drawCircle(x, cy, (if (hl) 22f else 19f) * d, solid)
+                solid.color = Color.argb((255 * a).toInt().coerceIn(0, 255), 30, 30, 36)
+                if (playing) {
+                    rect.set(x - 6 * d, cy - 7 * d, x - 2 * d, cy + 7 * d); c.drawRoundRect(rect, d, d, solid)
+                    rect.set(x + 2 * d, cy - 7 * d, x + 6 * d, cy + 7 * d); c.drawRoundRect(rect, d, d, solid)
+                } else {
+                    tri(c, x + d, cy, 14 * d, true, solid)
+                }
+            } else {
+                if (hl) { solid.color = argbW(60 * a); c.drawCircle(x, cy, 18 * d, solid) }
+                solid.color = argbW(235 * a)
+                val right = i == 2
+                val o = if (right) 1f else -1f
+                tri(c, x - o * 4 * d, cy, 10 * d, right, solid)
+                tri(c, x + o * 4 * d, cy, 10 * d, right, solid)
+            }
+        }
+        c.restore()
+    }
+
+    private fun drawCard(c: Canvas, r: Ring) {
+        val g = cardItem?.notif ?: return
+        val w = 196 * d
+        val h = 164 * d
+        cardRect.set(r.cx - w / 2f, r.cy - h / 2f, r.cx + w / 2f, r.cy + h / 2f)
+        clip.reset()
+        clip.addRoundRect(cardRect, 30 * d, 30 * d, Path.Direction.CW)
+        tint.color = Color.argb(70, 0, 0, 0)
+        c.drawPath(clip, tint)
+        glassPath(c, clip, cardRect.top, cardRect.bottom, 1f, 0f)
+
+        val left = cardRect.left + 18 * d
+        val tw = w - 36 * d
+        val by = cardRect.bottom - 16 * d - 32 * d
+        var y = cardRect.top + 26 * d
+        headL.textSize = 12 * d
+        headL.alpha = 170
+        val head = g.label + "  ·  " + g.count + (if (g.count == 1) " notification" else " notifications")
+        c.drawText(ellip(head, headL, tw), left, y, headL)
+        y += 22 * d
+        boldL.textSize = 14 * d
+        bodyL.textSize = 13 * d
+        bodyL.alpha = 225
+        loop@ for (chat in g.chats) {
+            if (y > by - 8 * d) break
+            c.drawText(ellip(chat.title, boldL, tw), left, y, boldL)
+            y += 18 * d
+            for (ln in chat.lines.takeLast(2)) {
+                if (y > by - 8 * d) break@loop
+                c.drawText(ellip(ln, bodyL, tw), left, y, bodyL)
+                y += 17 * d
+            }
+            y += 5 * d
+        }
+
+        openRect.set(left, by, left + (tw - 10 * d) / 2f, by + 32 * d)
+        clearRect.set(openRect.right + 10 * d, by, cardRect.right - 18 * d, by + 32 * d)
+        btnP.textSize = 13 * d
+        solid.color = if (cardHi == 0) Color.WHITE else Color.argb(230, 255, 255, 255)
+        c.drawRoundRect(openRect, 16 * d, 16 * d, solid)
+        btnP.color = Color.rgb(30, 30, 36)
+        val fm = btnP.fontMetrics
+        c.drawText("Open", openRect.centerX(), openRect.centerY() - (fm.ascent + fm.descent) / 2f, btnP)
+        solid.color = if (cardHi == 1) Color.argb(230, 255, 59, 48) else Color.argb(60, 255, 255, 255)
+        c.drawRoundRect(clearRect, 16 * d, 16 * d, solid)
+        btnP.color = Color.WHITE
+        c.drawText("Clear", clearRect.centerX(), clearRect.centerY() - (fm.ascent + fm.descent) / 2f, btnP)
+    }
 }
 
 // ===== BubbleService =====
-/** Keeps the bubble floating over every app and runs the hold-and-swipe gesture. */
+/**
+ * Keeps the robot bubble floating over every app.
+ * Tap: tap menu. Double tap: open the Bubble app. Hold: swipe menu. Double tap and hold: notifications.
+ */
 class BubbleService : Service() {
 
     private var wm: WindowManager? = null
     private var bubble: BubbleView? = null
     private var bp: WindowManager.LayoutParams? = null
     private var menu: RadialMenuView? = null
+    private var menuLp: WindowManager.LayoutParams? = null
     private var sfx: SoundFx? = null
     private var hap: Haptics? = null
     private val h = Handler(Looper.getMainLooper())
     private val dens by lazy { resources.displayMetrics.density }
 
-    private var mode = 0 // 0 idle, 1 pressed, 2 dragging, 3 menu open
+    private var mode = 0 // 0 idle, 1 pressed, 2 dragging, 3 swipe menu open
     private var downX = 0f
     private var downY = 0f
     private var lastX = 0f
@@ -932,9 +1768,18 @@ class BubbleService : Service() {
     private var startX = 0
     private var startY = 0
     private var receiverOn = false
+    private var secondTap = false
+    private var pendingTap = false
+    private var lastTapUp = 0L
 
-    private val holdRunnable = Runnable { if (mode == 1) { mode = 3; openMenu() } }
-    private val idleRunnable = Runnable { if (mode == 0) bubble?.animate()?.alpha(0.5f)?.setDuration(300)?.start() }
+    private val holdRunnable = Runnable { if (mode == 1) { mode = 3; openMenu(secondTap, false) } }
+    private val tapRunnable = Runnable { pendingTap = false; openMenu(false, true) }
+    private val musicPoll = object : Runnable {
+        override fun run() {
+            bubble?.musicOn = Media.playing(this@BubbleService) != null
+            h.postDelayed(this, 3000)
+        }
+    }
 
     private val pkgReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) = reload()
@@ -963,6 +1808,9 @@ class BubbleService : Service() {
         else registerReceiver(pkgReceiver, f)
         receiverOn = true
         addBubble()
+        BubbleNotifListener.onChange = { bubble?.badge = BubbleNotifListener.groups.isNotEmpty() }
+        bubble?.badge = BubbleNotifListener.groups.isNotEmpty()
+        h.post(musicPoll)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -989,7 +1837,7 @@ class BubbleService : Service() {
     @SuppressLint("ClickableViewAccessibility")
     private fun addBubble() {
         val w = wm ?: return
-        val size = (60 * dens).toInt()
+        val size = (66 * dens).toInt()
         val p = WindowManager.LayoutParams(
             size, size,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -1006,18 +1854,6 @@ class BubbleService : Service() {
         w.addView(v, p)
         bubble = v
         bp = p
-        scheduleIdle()
-    }
-
-    private fun wake() {
-        h.removeCallbacks(idleRunnable)
-        bubble?.animate()?.cancel()
-        bubble?.alpha = 1f
-    }
-
-    private fun scheduleIdle() {
-        h.removeCallbacks(idleRunnable)
-        h.postDelayed(idleRunnable, 2500)
     }
 
     private fun onTouch(e: MotionEvent) {
@@ -1025,19 +1861,24 @@ class BubbleService : Service() {
         val w = wm ?: return
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                wake()
+                val now = SystemClock.uptimeMillis()
+                bubble?.touch()
+                secondTap = pendingTap && now - lastTapUp < 300
+                h.removeCallbacks(tapRunnable)
+                pendingTap = false
                 mode = 1
                 downX = e.rawX; downY = e.rawY; lastX = e.rawX; lastY = e.rawY
                 startX = p.x; startY = p.y
-                bubble?.setPressedLook(true)
-                h.postDelayed(holdRunnable, 280)
+                bubble?.pressedLook = true
+                h.postDelayed(holdRunnable, 300)
             }
             MotionEvent.ACTION_MOVE -> {
                 lastX = e.rawX; lastY = e.rawY
                 if (mode == 1 && hypot(e.rawX - downX, e.rawY - downY) > 8 * dens) {
                     h.removeCallbacks(holdRunnable)
                     mode = 2
-                    bubble?.setPressedLook(false)
+                    bubble?.pressedLook = false
+                    bubble?.dragging = true
                 }
                 when (mode) {
                     2 -> {
@@ -1050,15 +1891,32 @@ class BubbleService : Service() {
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 h.removeCallbacks(holdRunnable)
-                bubble?.setPressedLook(false)
+                bubble?.pressedLook = false
                 when (mode) {
-                    2 -> snapToEdge()
+                    1 -> if (e.actionMasked == MotionEvent.ACTION_UP) {
+                        if (secondTap) {
+                            openSettings()
+                        } else {
+                            pendingTap = true
+                            lastTapUp = SystemClock.uptimeMillis()
+                            h.postDelayed(tapRunnable, 260)
+                        }
+                    }
+                    2 -> { bubble?.dragging = false; snapToEdge() }
                     3 -> menu?.release()
                 }
+                secondTap = false
                 mode = 0
-                scheduleIdle()
             }
         }
+    }
+
+    private fun openSettings() {
+        sfx?.play("sub")
+        hap?.click()
+        bubble?.flash(BubbleView.Mood.WINK, 900)
+        val i = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try { startActivity(i) } catch (e: Exception) { }
     }
 
     private fun snapToEdge() {
@@ -1085,7 +1943,7 @@ class BubbleService : Service() {
         sfx?.play("drop")
     }
 
-    private fun openMenu() {
+    private fun openMenu(notif: Boolean, tap: Boolean) {
         val w = wm ?: return
         val s = sfx ?: return
         val hp = hap ?: return
@@ -1096,29 +1954,32 @@ class BubbleService : Service() {
         s.play("open")
         hp.click()
 
-        val mv = RadialMenuView(this, s, hp, ::rootItems, ::customItems, object : RadialMenuView.Listener {
+        val mv = RadialMenuView(this, s, hp, ::rootItems, ::customItems, ::notifItems, object : RadialMenuView.Listener {
             override fun onLaunch(app: AppEntry) = launch(app)
+            override fun onOpenNotif(g: AppNotifs) = openNotif(g)
             override fun onClosed() = closeMenu()
+            override fun onWantTouch() = makeMenuTouchable()
         })
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_DIM_BEHIND
+        if (!tap) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_DIM_BEHIND,
+            flags,
             PixelFormat.TRANSLUCENT
         )
         lp.gravity = Gravity.TOP or Gravity.START
-        lp.dimAmount = 0.28f
+        lp.dimAmount = 0.3f
         if (Build.VERSION.SDK_INT >= 28) {
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         if (Build.VERSION.SDK_INT >= 31 && Store.blur(this)) {
             lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-            lp.blurBehindRadius = (22 * dens).toInt()
+            lp.blurBehindRadius = (24 * dens).toInt()
         }
         try {
             w.addView(mv, lp)
@@ -1126,24 +1987,57 @@ class BubbleService : Service() {
             return
         }
         menu = mv
+        menuLp = lp
         val loc = IntArray(2)
         bubble?.getLocationOnScreen(loc)
         val half = (bp?.width ?: 0) / 2f
-        mv.openRaw(lastX, lastY, loc[0] + half, loc[1] + half)
-        bubble?.animate()?.alpha(0.2f)?.setDuration(150)?.start()
+        val mc = if (notif) null else Media.playing(this)
+        mv.openRaw(lastX, lastY, loc[0] + half, loc[1] + half, notif, tap, mc)
+        bubble?.menuOpen = true
+        bubble?.animate()?.alpha(0.25f)?.setDuration(150)?.start()
+    }
+
+    private fun makeMenuTouchable() {
+        val m = menu ?: return
+        val lp = menuLp ?: return
+        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        try { wm?.updateViewLayout(m, lp) } catch (e: Exception) { }
     }
 
     private fun closeMenu() {
         val m = menu ?: return
         try { wm?.removeViewImmediate(m) } catch (e: Exception) { }
-        if (menu === m) menu = null
+        if (menu === m) { menu = null; menuLp = null }
+        bubble?.menuOpen = false
         bubble?.animate()?.alpha(1f)?.setDuration(200)?.start()
-        scheduleIdle()
     }
 
     private fun launch(app: AppEntry) {
+        bubble?.flash(BubbleView.Mood.WINK, 900)
         val i = packageManager.getLaunchIntentForPackage(app.pkg) ?: return
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        try { startActivity(i) } catch (e: Exception) { }
+    }
+
+    private fun openNotif(g: AppNotifs) {
+        bubble?.flash(BubbleView.Mood.WINK, 900)
+        val pi = g.intent
+        if (pi != null) {
+            try {
+                if (Build.VERSION.SDK_INT >= 34) {
+                    val o = ActivityOptions.makeBasic()
+                        .setPendingIntentBackgroundActivityStartMode(ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED)
+                    pi.send(this, 0, null, null, null, null, o.toBundle())
+                } else {
+                    pi.send()
+                }
+                return
+            } catch (e: Exception) {
+                // fall back to opening the app
+            }
+        }
+        val i = packageManager.getLaunchIntentForPackage(g.pkg) ?: return
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try { startActivity(i) } catch (e: Exception) { }
     }
 
@@ -1165,8 +2059,23 @@ class BubbleService : Service() {
         return list.ifEmpty { listOf(RadialMenuView.Item(RadialMenuView.Kind.EMPTY, "No categories", "＋")) }
     }
 
+    private fun notifItems(): List<RadialMenuView.Item> {
+        val gs = BubbleNotifListener.groups
+        if (gs.isEmpty()) {
+            val label = if (BubbleNotifListener.isEnabled(this)) "All clear" else "Allow access in app"
+            return listOf(RadialMenuView.Item(RadialMenuView.Kind.EMPTY, label, "🔔"))
+        }
+        val out = ArrayList<RadialMenuView.Item>()
+        for (g in gs) {
+            out.add(RadialMenuView.Item(RadialMenuView.Kind.NOTIF, g.label, "💬", notif = g, icon = AppRepo.byPkg(g.pkg)?.icon))
+        }
+        out.add(RadialMenuView.Item(RadialMenuView.Kind.CLEAR_ALL, "Clear all", "🧹"))
+        return out
+    }
+
     override fun onDestroy() {
         h.removeCallbacksAndMessages(null)
+        BubbleNotifListener.onChange = null
         val w = wm
         if (w != null) {
             menu?.let { try { w.removeViewImmediate(it) } catch (e: Exception) { } }
@@ -1206,6 +2115,8 @@ class MainActivity : Activity() {
     private lateinit var permBtn: Button
     private lateinit var mainSwitch: Switch
     private lateinit var customBox: LinearLayout
+    private lateinit var notifStatus: TextView
+    private lateinit var notifBtn: Button
     private var binding = false
 
     private val ink = Color.rgb(38, 33, 92)
@@ -1268,6 +2179,32 @@ class MainActivity : Activity() {
         feel.addView(switch("Blur background (Android 12+)", Store.blur(this)) { Store.setBlur(this, it) })
         col.addView(feel)
 
+        // ---- notifications and music card ----
+        val nc = card()
+        nc.addView(text("Notifications and music", 17f, ink, true))
+        notifStatus = text("", 14f, muted, false).apply { setPadding(0, dp(4), 0, 0) }
+        nc.addView(notifStatus)
+        notifBtn = button("Allow notification access") {
+            try { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) } catch (e: Exception) { toast("Open Settings > Notifications > Device and app notifications") }
+        }
+        nc.addView(notifBtn)
+        nc.addView(text("If Android says \"Restricted setting\", tap the button below, open the \u22EE menu at the top right and choose \"Allow restricted settings\". Then try again.", 13f, muted, false).apply {
+            setPadding(0, dp(8), 0, 0)
+        })
+        nc.addView(smallButton("Open app info") {
+            try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e: Exception) { }
+        }.apply { (layoutParams as LinearLayout.LayoutParams).apply { leftMargin = 0; topMargin = dp(8) } })
+        col.addView(nc)
+
+        // ---- gestures card ----
+        val gc = card()
+        gc.addView(text("Gestures", 17f, ink, true))
+        gc.addView(text("\u2022 Tap: open the menu and tap your way through\n\u2022 Hold: open the menu and swipe without lifting\n\u2022 Double tap: open this app\n\u2022 Double tap and hold: notifications\n\u2022 Drag: move the bubble", 14f, muted, false).apply {
+            setPadding(0, dp(6), 0, 0)
+            setLineSpacing(dp(4).toFloat(), 1f)
+        })
+        col.addView(gc)
+
         // ---- custom categories card ----
         val custom = card()
         val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
@@ -1309,6 +2246,12 @@ class MainActivity : Activity() {
         val can = Settings.canDrawOverlays(this)
         status.text = if (can) "✅  Ready" else "⚠️  Needs permission to float over apps"
         permBtn.visibility = if (can) View.GONE else View.VISIBLE
+        val nOn = BubbleNotifListener.isEnabled(this)
+        notifStatus.text = if (nOn) "\u2705  Red dot, message previews and music player are on" else "Needed for the red dot, message previews and the music player"
+        notifBtn.visibility = if (nOn) View.GONE else View.VISIBLE
+        if (nOn && Build.VERSION.SDK_INT >= 24) {
+            try { NotificationListenerService.requestRebind(ComponentName(this, BubbleNotifListener::class.java)) } catch (e: Exception) { }
+        }
         binding = true
         mainSwitch.isChecked = can && Store.enabled(this)
         binding = false
