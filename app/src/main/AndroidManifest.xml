@@ -40,6 +40,16 @@
                 android:value="Floating launcher bubble shown over other apps" />
         </service>
 
+        <service
+            android:name=".BubbleNotifListener"
+            android:exported="true"
+            android:label="Bubble notifications"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">
